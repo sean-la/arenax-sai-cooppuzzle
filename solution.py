@@ -1,6 +1,10 @@
 import gymnasium as gym
 import numpy as np
 import logging
+import sys
+import tty
+import termios
+
 
 from arenax_sai import SAIClient
 from stable_baselines3 import PPO
@@ -35,6 +39,7 @@ class State(Enum):
     FOUR = 4
     FIVE = 5
     SIX = 6
+    SEVEN = 7
     INVALID = -1
 
 
@@ -49,12 +54,29 @@ class Section(Enum):
     THREE = 3
     FOUR = 4
     FIVE = 5
+    INVALID = -1
 
 
 class Door(Enum):
     ONE = 1
     TWO = 2
     THREE = 3
+
+
+def get_key():
+    """
+    Get a single keypress from the user without requiring Enter.
+    Specifically for macOS.
+    Returns the character pressed as a string.
+    """
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    return ch
 
 
 def find_shortest_distance(maze, start: Tuple[int, int], end: Tuple[int, int]) -> int:
@@ -119,7 +141,7 @@ def find_shortest_distance(maze, start: Tuple[int, int], end: Tuple[int, int]) -
 
 class RewardShapingWrapper(Wrapper):
 
-    def __init__(self, env):
+    def __init__(self, env, movement_reward=1, incorrect_mouse_reward=-0.5):
         super().__init__(env)
         self.door_channel_map = {
             Door.ONE: 7,
@@ -129,12 +151,17 @@ class RewardShapingWrapper(Wrapper):
         self.current_mouse = Mouse.TOP
         self.previous_distance_to_target = None
         self.cumulative_reward = 0
+        self.previous_observation = None
+        self.previous_action = None
+        self.previous_state = None
+        self.movement_reward = movement_reward
+        self.incorrect_mouse_reward = incorrect_mouse_reward
 
         self.state_conditions = {
             State.ONE: [
                 lambda observation: (self.current_section(observation, Mouse.TOP) == Section.ONE),
                 lambda observation: (self.current_section(observation, Mouse.BOTTOM) == Section.FIVE),
-                lambda observation: (not self.door_is_open(observation, Door.THREE))
+                lambda observation: (not self.door_is_open(observation, Door.THREE)),
             ],
             State.TWO: [
                 lambda observation: self.door_is_open(observation, Door.THREE),
@@ -159,7 +186,6 @@ class RewardShapingWrapper(Wrapper):
                 lambda observation: (self.current_section(observation, Mouse.BOTTOM) == Section.THREE),
                 lambda observation: (self.current_section(observation, Mouse.TOP) in [Section.THREE, Section.TWO]),
                 lambda observation: (self.mouse_current_position(observation, Mouse.TOP) != (9, 6)),
-                lambda observation: (self.mouse_current_position(observation, Mouse.BOTTOM) != (9, 6)),
             ],
             State.SIX: [
                 lambda observation: (self.door_is_open(observation, Door.TWO)),
@@ -167,6 +193,11 @@ class RewardShapingWrapper(Wrapper):
                 lambda observation: (self.current_section(observation, Mouse.TOP) in [Section.THREE, Section.TWO]),
                 lambda observation: (self.mouse_current_position(observation, Mouse.TOP) == (9, 6)),
                 lambda observation: (self.mouse_current_position(observation, Mouse.BOTTOM) != (9, 6)),
+            ],
+            State.SEVEN: [
+                lambda observation: self.door_is_open(observation, Door.THREE),
+                lambda observation: (self.current_section(observation, Mouse.BOTTOM) == Section.THREE),
+                lambda observation: (self.current_section(observation, Mouse.TOP) in [Section.ONE, Section.TWO]),
             ]
         }
         self.reward_shaping_functions = {
@@ -184,7 +215,8 @@ class RewardShapingWrapper(Wrapper):
             ],
             State.FOUR: [
                 lambda observation: self.correct_mouse_reward(Mouse.TOP),
-                lambda observation: self.distance_to_target_delta_reward(observation, Mouse.TOP, (5, 11))
+                lambda observation: self.distance_to_target_delta_reward(observation, Mouse.TOP, (5, 11)),
+                lambda observation: -self.distance_to_target_delta_reward(observation, Mouse.TOP, (1, 1))/2
             ],
             State.FIVE: [
                 lambda observation: self.correct_mouse_reward(Mouse.TOP),
@@ -194,6 +226,10 @@ class RewardShapingWrapper(Wrapper):
                 lambda observation: self.correct_mouse_reward(Mouse.BOTTOM),
                 lambda observation: self.distance_to_target_delta_reward(observation, Mouse.BOTTOM, (9, 6))
             ],
+            State.SEVEN: [
+                lambda observation: self.correct_mouse_reward(Mouse.BOTTOM),
+                lambda observation: self.distance_to_target_delta_reward(observation, Mouse.BOTTOM, (9, 11)) 
+            ]
         }
 
 
@@ -201,7 +237,8 @@ class RewardShapingWrapper(Wrapper):
         maze = observation[:, :, 1]
         for door_channel_index in range(7, 12):
             door_channel = observation[:, :, door_channel_index]
-            maze += (door_channel == -1).astype(int)
+            maze -= (door_channel == -1).astype(int)
+        maze *= -1
         return maze
 
 
@@ -222,7 +259,7 @@ class RewardShapingWrapper(Wrapper):
             return 0
         else:
             current_distance_to_target = find_shortest_distance(maze, source, target)
-            logging.debug(f"Distance to target: {current_distance_to_target}")
+            logging.info(f"Distance of source {source} to target {target}: {current_distance_to_target}")
             delta = self.previous_distance_to_target - current_distance_to_target
             self.previous_distance_to_target = current_distance_to_target
             return delta
@@ -232,12 +269,12 @@ class RewardShapingWrapper(Wrapper):
         if self.current_mouse == desired_mouse:
             return 0
         else:
-            return -1
+            return self.incorrect_mouse_reward
 
 
-    def shape_reward(self, observation, reward):
+    def shape_reward(self, observation, reward, action, current_state):
         shaped_reward = reward
-        for shaping_function in self.reward_shaping_functions[self.current_state]:
+        for shaping_function in self.reward_shaping_functions[current_state]:
             shaped_reward += shaping_function(observation)
         return shaped_reward
 
@@ -249,7 +286,10 @@ class RewardShapingWrapper(Wrapper):
 
 
     def current_section(self, observation, mouse):
-        (row, _) = self.mouse_current_position(observation, mouse)
+        position = self.mouse_current_position(observation, mouse)
+        if position is None:
+            return Section.INVALID
+        row, _ = position
         if row < 3:
             return Section.ONE
         elif row < 7:
@@ -263,14 +303,14 @@ class RewardShapingWrapper(Wrapper):
 
 
     def determine_current_mouse(self, action):
-        if action != 9:
+        if action != 9 or self.previous_action == 9:
             current_mouse = self.current_mouse
         else:
             if self.current_mouse == Mouse.TOP:
                 current_mouse = Mouse.BOTTOM
             else:
                 current_mouse = Mouse.TOP
-        logging.debug(f"Current mouse: {current_mouse}")
+        logging.info(f"Current mouse: {current_mouse}")
         return current_mouse
 
 
@@ -292,6 +332,8 @@ class RewardShapingWrapper(Wrapper):
             if all(condition(observation) for condition in conditions)
         ]
         logging.debug(f"Current states: {current_states}")
+        self.previous_action = action
+        self.previous_observation = observation
         if len(current_states) != 1:
             return State.INVALID
         else:
@@ -300,15 +342,32 @@ class RewardShapingWrapper(Wrapper):
 
     def step(self, action):
         observation, reward, terminated, truncated, info = self.env.step(action)
-        self.current_state = self.determine_current_state(observation, action)
-        if self.current_state == State.INVALID:
-            shaped_reward = -self.cumulative_reward 
+        current_state = self.determine_current_state(observation, action)
+        logging.info(f"State: {current_state}")
+        if current_state == State.INVALID:
+            shaped_reward = 0
             self.cumulative_reward = 0
             terminated = True
+            for i, condition in enumerate(self.state_conditions[self.previous_state]):
+                if not condition(observation):
+                    logging.error(f"Invalid condition for state {self.previous_state}: {i}")
+            raise Exception("Entered invalid state")
         else:
-            shaped_reward = self.shape_reward(observation, reward)
+            shaped_reward = self.shape_reward(observation, reward, action, current_state)
             self.cumulative_reward += shaped_reward
-        logging.debug(f"Current reward: {shaped_reward}")
+            terminated = False
+            truncated = False
+        logging.info(f"Current reward: {shaped_reward}")
+        logging.info(f"Cumulative reward: {self.cumulative_reward}")
+        logging.debug(f"Door channels:\n")
+        for door, channel_index in self.door_channel_map.items():
+            channel = observation[:, :, channel_index]
+            logging.debug(f"Door {door}:\n{channel}")
+        for i in range(3):
+            channel_index = 2 + i
+            channel = observation[:, :, channel_index]
+            logging.debug(f"Switch {i+1}:\n{channel}")
+        self.previous_state = current_state
         return observation, shaped_reward, terminated, truncated, info
 
 
@@ -318,7 +377,9 @@ class RewardShapingWrapper(Wrapper):
         seed: int | None = None,
         options: dict[str, Any] | None = None,
     ):
-        self.current_mouse = Mouse.TOP
         self.previous_distance_to_target = None
         self.cumulative_reward = 0
-        return self.env.reset()
+        self.previous_state = State.ONE
+        self.env.reset()
+        observation, _, _, _, info = self.env.step(3)
+        return observation, info

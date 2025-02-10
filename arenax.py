@@ -7,7 +7,11 @@ import numpy as np
 
 from arenax_sai import SAIClient
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import BaseCallback, EventCallback, CheckpointCallback
+from stable_baselines3.common.callbacks import (
+    BaseCallback, 
+    EventCallback, 
+    CheckpointCallback
+)
 
 from env import RewardShapingWrapper, get_key, State
 from callbacks import RenderCallback, PretrainingCallback

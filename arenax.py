@@ -49,6 +49,8 @@ def main():
     parser.add_argument("--no_exploration", action="store_true", default=False)
     parser.add_argument("--pretrain_save_location", type=str, default=None)
     parser.add_argument("--vf_coef", type=float, default=0.5)
+    parser.add_argument("--num_demonstrations", type=int, default=1000)
+    parser.add_argument("--total_timesteps", type=int, default=1e6)
     args = parser.parse_args()
 
     np.set_printoptions(threshold=sys.maxsize)
@@ -116,7 +118,7 @@ def main():
             callbacks.append(pretraining_callback)
 
         model.learn(
-            total_timesteps=1e15, 
+            total_timesteps=args.total_timesteps,
             callback=callbacks
         )
     elif args.mode == "demonstrate":
@@ -131,30 +133,29 @@ def main():
 
         # Run the trained model
         obs, info = env.reset()
-        try:
-            while True:
-                if (
-                    args.oracle_state is not None \
-                    and info.get("state", State.RESET) >= oracle_state
-                ):
+        while len(demonstrations) < args.num_demonstrations:
+            if (
+                args.oracle_state is not None \
+                and info.get("state", State.RESET) >= oracle_state
+            ):
 
-                    action = info["action"]
-                else:
-                    action, _ = model.predict(obs, deterministic=True)
+                action = info["action"]
+            else:
+                action, _ = model.predict(obs, deterministic=True)
 
-                demonstration = {
-                    "observation": obs,
-                    "action": action
-                }
-                demonstrations.append(demonstration)
-                obs, reward, terminated, truncated, info = env.step(action)
-                env.render()
-                if terminated or truncated:
-                    obs, info = env.reset()
-        except KeyboardInterrupt:
-            if args.demos_path:
-                logging.info(f"Saving demonstrations to path {args.demos_path}")
-                np.save(args.demos_path, demonstrations, allow_pickle=True)
+            demonstration = {
+                "observation": obs,
+                "action": action
+            }
+            demonstrations.append(demonstration)
+            obs, reward, terminated, truncated, info = env.step(action)
+            env.render()
+            if terminated or truncated:
+                obs, info = env.reset()
+
+        if args.demos_path:
+            logging.info(f"Saving demonstrations to path {args.demos_path}")
+            np.save(args.demos_path, demonstrations, allow_pickle=True)
     else:
         env.reset()
         while True:

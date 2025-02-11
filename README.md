@@ -10,3 +10,5 @@ using behavioural cloning.
 
 You might need to run this script a few times to get the shortest path algorithm
 to work.
+
+The final Stable Baselines3 model is `res/pretrain.model`.

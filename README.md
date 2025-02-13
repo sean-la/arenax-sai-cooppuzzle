@@ -1,5 +1,7 @@
 # SAI Co-op Puzzle Competition: Reinforcement Learning and Behavioural Cloning
 
+This solution won the "FASTEST TIME TO SOLVE THE CO-OP PUZZLE" competition on [ArenaX Labs' SAI platform](https://sai.arenaxlabs.dev).
+
 Run `./train.sh` to replicate my solution.
 The script performs two steps:
 
